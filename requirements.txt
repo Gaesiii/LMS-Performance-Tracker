@@ -1,0 +1,8 @@
+fastapi==0.110.0
+uvicorn==0.28.0
+beautifulsoup4==4.12.3
+google-genai==0.3.0
+python-dotenv==1.0.1
+SQLAlchemy==2.0.28
+PyMySQL==1.1.0
+cryptography==42.0.5
