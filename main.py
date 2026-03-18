@@ -1,27 +1,57 @@
+import os
+import re
+from datetime import datetime
+from typing import List
+
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import google.generativeai as genai
-from datetime import datetime
 from bs4 import BeautifulSoup
-import re
 import uvicorn
 
-# --- THƯ VIỆN DATABASE MYSQL ---
+# Thư viện AI mới của Google
+from google import genai
+
+# Thư viện hỗ trợ môi trường và Database
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 # ==========================================
-# 1. CẤU HÌNH DATABASE MYSQL
+# 1. KHỞI TẠO BIẾN MÔI TRƯỜNG & KẾT NỐI AIVEN
 # ==========================================
-SQLALCHEMY_DATABASE_URL = "mysql+pymysql://root:123456@localhost:3306/mindx_ai_db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+load_dotenv()
+
+# Lấy URL từ .env
+raw_db_url = os.getenv("DATABASE_URL", "")
+
+# Tự động sửa lỗi nếu link Aiven thiếu "pymysql"
+if raw_db_url.startswith("mysql://"):
+    DATABASE_URL = raw_db_url.replace("mysql://", "mysql+pymysql://", 1)
+else:
+    DATABASE_URL = raw_db_url
+
+# Đường dẫn file chứng chỉ SSL (Tải từ Aiven Console và để cùng thư mục main.py)
+CA_PEM_PATH = os.path.join(os.path.dirname(__file__), "ca.pem")
+
+# Cấu hình Engine đặc biệt cho Aiven (Bắt buộc SSL)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "ssl": {
+            "ca": CA_PEM_PATH
+        }
+    },
+    pool_recycle=3600, # Tự động làm mới kết nối sau 1 giờ
+    pool_pre_ping=True # Kiểm tra kết nối trước khi sử dụng để tránh lỗi "Lost connection"
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ==========================================
-# 2. KHAI BÁO BẢNG (RELATIONAL SCHEMA)
+# 2. ĐỊNH NGHĨA CẤU TRÚC DATABASE (MODELS)
 # ==========================================
 class ClassRecord(Base):
     __tablename__ = "classes"
@@ -55,15 +85,17 @@ class Evaluation(Base):
     scores = Column(String(100))  
     ai_comment = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
+    
     student_ref = relationship("Student", back_populates="evaluations")
     lesson_ref = relationship("Lesson", back_populates="evaluations")
 
+# Tự động khởi tạo bảng trên Aiven Cloud
 Base.metadata.create_all(bind=engine)
 
 # ==========================================
-# 3. FASTAPI & HỆ THỐNG LOGS
+# 3. LOGIC XỬ LÝ & BÓC TÁCH HTML
 # ==========================================
-app = FastAPI(title="Local AI Hub MySQL")
+app = FastAPI(title="LMS Performance Tracker API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
     allow_methods=["*"], allow_headers=["*"]
@@ -84,28 +116,23 @@ class AIRequest(BaseModel):
     scores: str        
     raw_html: str
 
-# ==========================================
-# 4. HÀM CHẠY NGẦM: BÓC TÁCH BS4 & LƯU DB
-# ==========================================
 def process_and_save_data(raw_html: str, keywords: str, scores_str: str, ai_comment: str):
-    add_log("⚙️ [Chạy ngầm] Đang dùng BS4 bóc tách HTML...", "INFO")
-    
-    class_code = None
-    lesson_number = None
-    student_name = "Chưa nhận diện được tên"
-    
+    add_log("⚙️ Đang thực hiện bóc tách và đối chiếu dữ liệu...", "INFO")
+    db = SessionLocal()
     try:
         soup = BeautifulSoup(raw_html, 'html.parser')
         
-        # --- A. TÌM MÃ LỚP ---
+        # 1. Tìm Mã lớp (Lấy từ h6 Typography)
+        class_code = "UNKNOWN"
         h6_tags = soup.find_all('h6', class_='MuiTypography-h6')
         for tag in h6_tags:
             match = re.search(r'\b([A-Z]{2,4}-[A-Z0-9]+-[A-Z0-9]+)\b', tag.text)
             if match:
                 class_code = match.group(1)
                 break
-                
-        # --- B. TÌM SỐ BUỔI ---
+        
+        # 2. Tìm Buổi học (# số)
+        lesson_number = 1
         info_divs = soup.select('.info-container div')
         for div in info_divs:
             match = re.search(r'#\s*(\d+)', div.text)
@@ -113,50 +140,21 @@ def process_and_save_data(raw_html: str, keywords: str, scores_str: str, ai_comm
                 lesson_number = int(match.group(1))
                 break
 
-        # --- C. TÌM TÊN BẰNG THUẬT TOÁN ĐỐI CHIẾU CHÉO (H3 & NAME-DISPLAY) ---
+        # 3. Thuật toán Đối chiếu chéo Tên (H3 trong Popup vs span danh sách)
+        student_name = "Ẩn danh"
+        valid_names = [span.get_text(strip=True) for span in soup.find_all('span', class_='name-display')]
         
-        # Bước 1: Quét danh sách toàn bộ Tên hợp lệ từ thẻ span.name-display ở trang nền
-        valid_names = [span.get_text(strip=True) for span in soup.find_all('span', class_='name-display') if span.get_text(strip=True)]
-        
-        if valid_names:
-            # Bước 2: Tìm vùng Popup Form (role='dialog' hoặc quét toàn thân nếu không rõ class)
-            popup_area = soup.find('div', role='dialog') or soup
-            
-            # Bước 3: Tìm tất cả thẻ H3 trong vùng này
-            h3_tags = popup_area.find_all('h3')
-            
-            found_name = None
-            for h3 in h3_tags:
-                h3_text = h3.get_text(strip=True)
-                
-                # Dò xem tên nào trong danh sách hợp lệ nằm bên trong câu của thẻ H3
-                for name in valid_names:
-                    if name in h3_text:
-                        found_name = name
-                        break # Dừng dò tên
-                
-                if found_name:
-                    break # Dừng quét H3
-                    
-            if found_name:
-                student_name = found_name
-                add_log(f"🎯 Đối chiếu chéo thành công Tên học viên: {student_name}", "SUCCESS")
-            else:
-                add_log("⚠️ Không tìm thấy tên nào khớp giữa danh sách (span) và Popup (H3)!", "WARNING")
-        else:
-            add_log("⚠️ Không quét được danh sách tên nền (span.name-display)!", "WARNING")
+        popup = soup.find('div', role='dialog') or soup
+        h3_tags = popup.find_all('h3')
+        for h3 in h3_tags:
+            h3_text = h3.get_text(strip=True)
+            for name in valid_names:
+                if name in h3_text:
+                    student_name = name
+                    break
+            if student_name != "Ẩn danh": break
 
-    except Exception as e:
-        add_log(f"❌ Lỗi BeautifulSoup: {str(e)}", "ERROR")
-        return
-
-    if not class_code or not lesson_number:
-        add_log("❌ Không bắt được Mã lớp hoặc Buổi học. Bỏ qua lưu Database!", "ERROR")
-        return
-
-    # --- D. XỬ LÝ LƯU DATABASE MYSQL ---
-    db = SessionLocal()
-    try:
+        # 4. Lưu vào Aiven MySQL
         db_class = db.query(ClassRecord).filter(ClassRecord.class_code == class_code).first()
         if not db_class:
             db_class = ClassRecord(class_code=class_code)
@@ -173,97 +171,68 @@ def process_and_save_data(raw_html: str, keywords: str, scores_str: str, ai_comm
             db.add(db_lesson); db.commit(); db.refresh(db_lesson)
 
         new_eval = Evaluation(
-            student_id=db_student.id,
-            lesson_id=db_lesson.id,
-            keywords=keywords,
-            scores=scores_str, 
-            ai_comment=ai_comment
+            student_id=db_student.id, lesson_id=db_lesson.id,
+            keywords=keywords, scores=scores_str, ai_comment=ai_comment
         )
-        db.add(new_eval)
-        db.commit()
+        db.add(new_eval); db.commit()
+        add_log(f"💾 Dataset thành công: {student_name} | Lớp {class_code} | Buổi {lesson_number}", "SUCCESS")
         
-        add_log(f"💾 [MySQL] Đã lưu! | Lớp: {class_code} | Buổi: {lesson_number} | Tên: {student_name}", "SUCCESS")
     except Exception as e:
         db.rollback()
-        add_log(f"❌ Lỗi lưu MySQL: {str(e)}", "ERROR")
+        add_log(f"❌ Lỗi lưu Database: {str(e)}", "ERROR")
     finally:
         db.close()
 
 # ==========================================
-# 5. API ENDPOINT CHÍNH (GỌI AI & KÍCH HOẠT LƯU NGẦM)
+# 4. API ENDPOINTS
 # ==========================================
 @app.post("/api/generate")
 async def generate_comment(request: AIRequest, background_tasks: BackgroundTasks):
-    add_log(f"📥 REQUEST ĐẾN: Nhận {len(request.raw_html)} ký tự HTML từ Extension...", "INFO")
-    add_log(f"   👉 Từ khóa: {request.keywords}", "INFO")
-    add_log(f"   👉 Barem điểm: {request.scores}", "INFO")
-    
+    add_log(f"📥 Extension gửi yêu cầu nhận xét...", "INFO")
     try:
-        genai.configure(api_key=request.api_key)
-        model = genai.GenerativeModel(request.model)
+        # Sử dụng SDK mới của Google (google-genai)
+        client = genai.Client(api_key=request.api_key)
         
-        add_log(f"🧠 Đang gửi Prompt cho {request.model}...", "INFO")
-        response = model.generate_content(request.prompt)
-        ai_result_text = response.text.strip()
-        add_log("✅ AI đã sinh nhận xét siêu tốc!", "SUCCESS")
-        
-        # Đẩy công việc bóc tách HTML và lưu MySQL ra luồng Background
-        background_tasks.add_task(
-            process_and_save_data, 
-            request.raw_html, 
-            request.keywords, 
-            request.scores,
-            ai_result_text
+        response = client.models.generate_content(
+            model=request.model,
+            contents=request.prompt,
         )
         
-        return {"status": "success", "data": ai_result_text}
+        ai_text = response.text.strip()
         
+        # Chạy bóc tách HTML ngầm để trả kết quả AI cho người dùng ngay lập tức
+        background_tasks.add_task(process_and_save_data, request.raw_html, request.keywords, request.scores, ai_text)
+        
+        return {"status": "success", "data": ai_text}
     except Exception as e:
-        add_log(f"❌ Lỗi API Gemini: {str(e)}", "ERROR")
+        add_log(f"❌ Lỗi AI Gemini: {str(e)}", "ERROR")
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/logs")
 async def get_logs(): return {"logs": SYSTEM_LOGS}
 
-# ==========================================
-# 6. GIAO DIỆN TERMINAL TRÊN TRÌNH DUYỆT
-# ==========================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     return """
-    <!DOCTYPE html>
-    <html lang="vi">
-    <head>
-        <meta charset="UTF-8">
-        <title>Trạm Giám Sát AI</title>
-        <style>
-            body { background: #121212; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
-            h2 { color: #fff; border-bottom: 1px solid #333; padding-bottom: 10px;}
-            .log-box { background: #000; padding: 20px; border-radius: 5px; border: 1px solid #333; height: 70vh; overflow-y: auto;}
-            .log-time { color: #888; margin-right: 10px; }
-            .log-INFO { color: #00d8ff; }
-            .log-SUCCESS { color: #00ff00; font-weight: bold;}
-            .log-ERROR { color: #ff5555; font-weight: bold;}
-            .log-row { margin-bottom: 8px; line-height: 1.4;}
-        </style>
-    </head>
-    <body>
-        <h2>🖥️ Trạm Cào Data & AI Dataset Hub</h2>
-        <div style="margin-bottom: 10px; color: #888;">Trạng thái Database: <i>Sẵn sàng (MySQL Relational)</i></div>
-        <div class="log-box" id="term"><div style="color:#888;">> Hệ thống đang lắng nghe...</div></div>
-        <script>
-            async function fetchLogs() {
-                try {
-                    const res = await fetch('/api/logs'); const data = await res.json();
-                    if(data.logs.length > 0) {
-                        document.getElementById('term').innerHTML = data.logs.map(l => `<div class="log-row"><span class="log-time">[${l.time}]</span><span class="log-${l.status}">> ${l.msg}</span></div>`).join('');
-                    }
-                } catch(e) {}
-            }
-            setInterval(fetchLogs, 1000);
-        </script>
-    </body>
-    </html>
+    <html><head><title>LMS Tracker Dashboard</title><style>
+    body { background: #0a0a0a; color: #00ff41; font-family: 'Consolas', monospace; padding: 40px; }
+    .terminal { background: #000; border: 1px solid #00ff41; height: 75vh; overflow-y: auto; padding: 20px; box-shadow: 0 0 20px rgba(0,255,65,0.2); }
+    .SUCCESS { color: #00ff41; font-weight: bold; } 
+    .ERROR { color: #ff3131; } 
+    .INFO { color: #00b8ff; }
+    h2 { border-bottom: 2px solid #00ff41; display: inline-block; padding-bottom: 5px; }
+    </style></head><body>
+    <h2>> LMS_PERFORMANCE_TRACKER_SYSTEM</h2>
+    <p>Database Status: <span class="SUCCESS">CONNECTED (AIVEN_CLOUD)</span></p>
+    <div class="terminal" id="terminal"></div>
+    <script>
+        setInterval(async () => {
+            try {
+                const r = await fetch('/api/logs'); const d = await r.json();
+                document.getElementById('terminal').innerHTML = d.logs.map(l => `<div>[${l.time}] <span class="${l.status}">>> ${l.msg}</span></div>`).join('');
+            } catch(e) {}
+        }, 1000);
+    </script></body></html>
     """
 
 if __name__ == "__main__":
