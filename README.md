@@ -17,7 +17,9 @@ uvicorn main:app --reload
 - `SALE_ALLOWED_GOOGLE_DOMAIN` (optional domain allow-list, e.g. `mindx.edu.vn`)
 
 ## Web UI
-- Sale dashboard: `GET /sale-dashboard`
+- Sale dashboard (index): `GET /`
+- Sale dashboard alias: `GET /sale-dashboard`
+- System log dashboard: `GET /system-dashboard`
 - Features:
   - Google login for sale account
   - Manual fallback login

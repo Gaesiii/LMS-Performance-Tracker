@@ -1539,6 +1539,7 @@ def render_sale_dashboard_html() -> str:
     )
 
 
+@app.get("/", response_class=HTMLResponse)
 @app.get("/sale-dashboard", response_class=HTMLResponse)
 async def sale_dashboard():
     return render_sale_dashboard_html()
@@ -1549,8 +1550,8 @@ async def get_logs():
     return {"logs": SYSTEM_LOGS}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
+@app.get("/system-dashboard", response_class=HTMLResponse)
+async def system_dashboard():
     return """
     <html>
       <head>
@@ -1569,7 +1570,9 @@ async def dashboard():
         <h2>LMS PERFORMANCE TRACKER API</h2>
         <div class="tips">
           Endpoints:<br/>
-          - <a href="/sale-dashboard" style="color:#8be9fd">/sale-dashboard</a><br/>
+          - <a href="/" style="color:#8be9fd">/ (sale dashboard)</a><br/>
+          - <a href="/sale-dashboard" style="color:#8be9fd">/sale-dashboard (alias)</a><br/>
+          - <a href="/system-dashboard" style="color:#8be9fd">/system-dashboard</a><br/>
           - POST /api/auth/sale/login<br/>
           - POST /api/auth/sale/google<br/>
           - GET /api/sale/teachers<br/>
