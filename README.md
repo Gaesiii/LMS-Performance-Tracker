@@ -1,4 +1,4 @@
-# LMS Performance Tracker (Server)
+# LMS Performance Tracker (Server + Sale Dashboard)
 
 ## Run
 ```bash
@@ -6,36 +6,55 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-## Required env
-- `DATABASE_URL` (MySQL/Aiven or fallback to local SQLite if missing)
-- `SALE_DEFAULT_EMAIL` (optional, default: `sale@mindx.local`)
-- `SALE_DEFAULT_NAME` (optional, default: `Default Sale`)
-- `SALE_DEFAULT_PASSWORD` (required if you want bootstrap sale login account)
-- `SESSION_TTL_HOURS` (optional, default: `24`)
+## Important env vars
+- `DATABASE_URL`
+- `SALE_DEFAULT_EMAIL` (default: `sale@mindx.local`)
+- `SALE_DEFAULT_NAME` (default: `Default Sale`)
+- `SALE_DEFAULT_PASSWORD` (for bootstrap manual sale account)
+- `SESSION_TTL_HOURS` (default: `24`)
+- `GOOGLE_CLIENT_ID` (required for web Google login on `/sale-dashboard`)
+- `SALE_ALLOWED_GOOGLE_EMAILS` (comma-separated allow-list)
+- `SALE_ALLOWED_GOOGLE_DOMAIN` (optional domain allow-list, e.g. `mindx.edu.vn`)
+
+## Web UI
+- Sale dashboard: `GET /sale-dashboard`
+- Features:
+  - Google login for sale account
+  - Manual fallback login
+  - Add/update teacher list (UID + email + name)
+  - Push trial task to teacher
+  - View recent dispatched tasks
 
 ## Core APIs
 
-### 1) Sale login
-`POST /api/auth/sale/login`
-```json
-{
-  "email": "sale@mindx.local",
-  "password": "your_password"
-}
-```
+### Sale auth
+- `POST /api/auth/sale/login`
+- `POST /api/auth/sale/google`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
 
-### 2) Sale push trial tasks to teachers
+### Teacher directory (for sale)
+- `GET /api/sale/teachers`
+- `POST /api/sale/teachers/upsert`
+- `POST /api/sale/teachers/token`
+
+### Task dispatch (sale -> teacher)
+- `POST /api/sale/tasks/push`
+- `GET /api/sale/tasks`
+
+### Extension sync (teacher extension)
+- `GET /api/trial-tasks?userId=<teacher_uid>&token=<optional_teacher_token>`
+- `POST /api/trial-tasks/submit`
+
+## Example: push task
 `POST /api/sale/tasks/push`
-
-Headers:
-- `Authorization: Bearer <sale_token>`
-
-Body:
 ```json
 {
   "tasks": [
     {
       "teacher_uid": "teacher_001",
+      "teacher_email": "teacher001@mindx.edu.vn",
+      "teacher_name": "Teacher Minh",
       "student_name": "Nguyen Minh Anh",
       "age": 10,
       "course": "Scratch SB",
@@ -47,53 +66,5 @@ Body:
       "data_logs": "pushed from sale dashboard"
     }
   ]
-}
-```
-
-### 3) Extension fetch assigned tasks
-`GET /api/trial-tasks?userId=<teacher_uid>&token=<optional_teacher_token>`
-
-### 4) Extension submit trial result
-`POST /api/trial-tasks/submit`
-```json
-{
-  "userId": "teacher_001",
-  "authMethod": "manual",
-  "token": "",
-  "submittedAt": "2026-04-06T10:30:00Z",
-  "tasks": [
-    {
-      "id": "trial-abc123",
-      "studentName": "Nguyen Minh Anh",
-      "age": 10,
-      "course": "Scratch SB",
-      "notes": "First trial class",
-      "consultantInfo": "Sale A",
-      "schedule": {
-        "date": "2026-04-06",
-        "time": "18:30"
-      },
-      "trialStatus": "pass",
-      "absent": false,
-      "feedback": "Good communication and logic",
-      "dataLogs": "submitted from extension popup",
-      "source": "assigned",
-      "updatedAt": "2026-04-06T10:29:00Z"
-    }
-  ]
-}
-```
-
-### 5) Optional teacher token generation (by sale)
-`POST /api/sale/teachers/token`
-
-Headers:
-- `Authorization: Bearer <sale_token>`
-
-Body:
-```json
-{
-  "teacher_uid": "teacher_001",
-  "teacher_name": "Teacher Minh"
 }
 ```

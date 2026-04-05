@@ -12,8 +12,10 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Qu
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from google import genai
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, create_engine, func
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 
@@ -191,6 +193,13 @@ app.add_middleware(
 
 SYSTEM_LOGS = []
 SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+SALE_ALLOWED_GOOGLE_DOMAIN = os.getenv("SALE_ALLOWED_GOOGLE_DOMAIN", "").strip().lower()
+SALE_ALLOWED_GOOGLE_EMAILS = {
+    email.strip().lower()
+    for email in os.getenv("SALE_ALLOWED_GOOGLE_EMAILS", "").split(",")
+    if email.strip()
+}
 
 
 def utcnow() -> datetime:
@@ -253,6 +262,57 @@ def verify_password(password: str, user: UserAccount) -> bool:
         return False
     compared = hash_password(password, user.password_salt)
     return secrets.compare_digest(compared, user.password_hash)
+
+
+def is_sale_google_email_allowed(email: str) -> bool:
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return False
+    if SALE_ALLOWED_GOOGLE_EMAILS and normalized in SALE_ALLOWED_GOOGLE_EMAILS:
+        return True
+    if SALE_ALLOWED_GOOGLE_DOMAIN and normalized.endswith(f"@{SALE_ALLOWED_GOOGLE_DOMAIN}"):
+        return True
+    return False
+
+
+def upsert_sale_user_from_google(db: Session, google_sub: str, email: str, full_name: str) -> UserAccount:
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        raise HTTPException(status_code=400, detail="Google account email is missing")
+
+    existing = db.query(UserAccount).filter(UserAccount.email == normalized_email).first()
+    if existing:
+        if existing.role not in {"sale", "admin"} and not is_sale_google_email_allowed(normalized_email):
+            raise HTTPException(status_code=403, detail="Google account is not allowed for sale login")
+
+        if existing.role not in {"sale", "admin"}:
+            existing.role = "sale"
+        existing.auth_provider = "google"
+        existing.full_name = full_name or existing.full_name or normalized_email
+        if not existing.user_uid:
+            existing.user_uid = f"sale-google-{google_sub}"
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    if not is_sale_google_email_allowed(normalized_email):
+        raise HTTPException(
+            status_code=403,
+            detail="Google account is not allowed. Configure SALE_ALLOWED_GOOGLE_EMAILS or SALE_ALLOWED_GOOGLE_DOMAIN.",
+        )
+
+    user = UserAccount(
+        user_uid=f"sale-google-{google_sub}",
+        email=normalized_email,
+        full_name=full_name or normalized_email,
+        role="sale",
+        auth_provider="google",
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -339,6 +399,7 @@ def serialize_task(task: TrialTask) -> dict:
         "updatedAt": to_iso(task.updated_at),
         "submittedAt": to_iso(task.submitted_at),
         "teacherUid": task.teacher.user_uid if task.teacher else None,
+        "teacherEmail": task.teacher.email if task.teacher else None,
         "assignedBy": task.assigned_by.full_name if task.assigned_by else None,
     }
 
@@ -356,22 +417,42 @@ def create_session(db: Session, user: UserAccount) -> AuthSession:
     return session_row
 
 
-def find_or_create_teacher(db: Session, teacher_uid: str, full_name: str = "") -> UserAccount:
+def find_or_create_teacher(
+    db: Session,
+    teacher_uid: str,
+    full_name: str = "",
+    email: str = "",
+) -> UserAccount:
     uid = (teacher_uid or "").strip()
+    normalized_email = email.strip().lower() if email else ""
     if not uid:
         raise HTTPException(status_code=400, detail="teacher_uid is required")
 
+    if normalized_email:
+        email_owner = db.query(UserAccount).filter(UserAccount.email == normalized_email).first()
+        if email_owner and email_owner.user_uid != uid:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Email already used by another account: {normalized_email}",
+            )
+
     user = db.query(UserAccount).filter(UserAccount.user_uid == uid).first()
     if user:
-        if full_name and not user.full_name:
+        changed = False
+        if full_name and (not user.full_name or user.full_name == user.user_uid):
             user.full_name = full_name
+            changed = True
+        if normalized_email and user.email != normalized_email:
+            user.email = normalized_email
+            changed = True
+        if changed:
             db.commit()
             db.refresh(user)
         return user
 
     user = UserAccount(
         user_uid=uid,
-        email=None,
+        email=normalized_email or None,
         full_name=full_name or uid,
         role="teacher",
         auth_provider="manual",
@@ -440,13 +521,25 @@ class SaleLoginRequest(BaseModel):
     password: str
 
 
+class GoogleSaleLoginRequest(BaseModel):
+    idToken: str
+
+
 class TeacherTokenRequest(BaseModel):
     teacher_uid: str
     teacher_name: str = ""
 
 
+class TeacherUpsertRequest(BaseModel):
+    teacher_uid: str = Field(min_length=1)
+    teacher_email: str = ""
+    teacher_name: str = ""
+
+
 class SaleAssignTaskItem(BaseModel):
     teacher_uid: str = Field(min_length=1)
+    teacher_email: str = ""
+    teacher_name: str = ""
     student_name: str = Field(min_length=1)
     age: int = 0
     course: str = Field(min_length=1)
@@ -628,6 +721,47 @@ def sale_login(payload: SaleLoginRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/api/auth/sale/google")
+def sale_google_login(payload: GoogleSaleLoginRequest, db: Session = Depends(get_db)):
+    token = (payload.idToken or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="idToken is required")
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured on server")
+
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {exc}") from exc
+
+    email = (idinfo.get("email") or "").strip().lower()
+    email_verified = bool(idinfo.get("email_verified"))
+    full_name = (idinfo.get("name") or "").strip()
+    google_sub = (idinfo.get("sub") or "").strip()
+
+    if not google_sub or not email or not email_verified:
+        raise HTTPException(status_code=401, detail="Google account is missing verified email")
+
+    user = upsert_sale_user_from_google(db, google_sub=google_sub, email=email, full_name=full_name)
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is disabled")
+
+    session_row = create_session(db, user)
+    add_log(f"Sale Google login: {email}", "SUCCESS")
+    return {
+        "status": "success",
+        "data": {
+            "token": session_row.token,
+            "expiresAt": to_iso(session_row.expires_at),
+            "user": serialize_user(user),
+        },
+    }
+
+
 @app.post("/api/auth/logout")
 def logout(
     authorization: Optional[str] = Header(default=None),
@@ -670,6 +804,57 @@ def create_teacher_token(
     }
 
 
+@app.post("/api/sale/teachers/upsert")
+def sale_upsert_teacher(
+    payload: TeacherUpsertRequest,
+    current_user: UserAccount = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    require_role(current_user, {"sale", "admin"})
+    teacher = find_or_create_teacher(
+        db,
+        teacher_uid=payload.teacher_uid,
+        full_name=payload.teacher_name,
+        email=payload.teacher_email,
+    )
+    add_log(f"Teacher upserted by sale: {teacher.user_uid} ({teacher.email or 'no-email'})", "SUCCESS")
+    return {"status": "success", "teacher": serialize_user(teacher)}
+
+
+@app.get("/api/sale/teachers")
+def sale_list_teachers(
+    current_user: UserAccount = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    require_role(current_user, {"sale", "admin"})
+    teachers = (
+        db.query(UserAccount)
+        .filter(UserAccount.role == "teacher")
+        .order_by(UserAccount.updated_at.desc())
+        .limit(1000)
+        .all()
+    )
+
+    teacher_ids = [teacher.id for teacher in teachers]
+    count_by_teacher_id = {}
+    if teacher_ids:
+        rows = (
+            db.query(TrialTask.teacher_user_id, func.count(TrialTask.id))
+            .filter(TrialTask.teacher_user_id.in_(teacher_ids))
+            .group_by(TrialTask.teacher_user_id)
+            .all()
+        )
+        count_by_teacher_id = {teacher_id: count for teacher_id, count in rows}
+
+    result = []
+    for teacher in teachers:
+        item = serialize_user(teacher)
+        item["taskCount"] = int(count_by_teacher_id.get(teacher.id, 0))
+        result.append(item)
+
+    return {"status": "success", "count": len(result), "teachers": result}
+
+
 @app.post("/api/sale/tasks/push")
 def sale_push_tasks(
     payload: SalePushTasksRequest,
@@ -682,7 +867,12 @@ def sale_push_tasks(
 
     created = []
     for item in payload.tasks:
-        teacher = find_or_create_teacher(db, item.teacher_uid)
+        teacher = find_or_create_teacher(
+            db,
+            teacher_uid=item.teacher_uid,
+            full_name=item.teacher_name,
+            email=item.teacher_email,
+        )
         task = TrialTask(
             task_uid=f"trial-{secrets.token_hex(8)}",
             teacher_user_id=teacher.id,
@@ -827,6 +1017,533 @@ def extension_submit_tasks(payload: ExtensionSubmitRequest, db: Session = Depend
     }
 
 
+def render_sale_dashboard_html() -> str:
+    template = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>LMS Sale Dashboard</title>
+        <script src="https://accounts.google.com/gsi/client" async defer></script>
+        <style>
+          :root {
+            --bg: #f3f8ff;
+            --panel: #ffffff;
+            --line: #d7e3f1;
+            --text: #102a43;
+            --muted: #486581;
+            --primary: #0052cc;
+            --primary-dark: #003f9e;
+            --error: #c62828;
+            --ok: #1b8f4b;
+          }
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            color: var(--text);
+            background: radial-gradient(circle at 10% 5%, #eaf1ff 0, var(--bg) 55%);
+          }
+          .wrap { max-width: 1220px; margin: 0 auto; padding: 18px; }
+          .header {
+            display: flex; justify-content: space-between; align-items: center; gap: 12px;
+            background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
+          }
+          .title h1 { margin: 0; font-size: 20px; }
+          .title p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+          .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+          .panel {
+            background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+            padding: 14px; box-shadow: 0 8px 20px rgba(16,42,67,.05);
+          }
+          .panel h2 { margin: 0 0 10px; font-size: 16px; }
+          .muted { color: var(--muted); font-size: 13px; }
+          .full { grid-column: 1 / -1; }
+          label { display: block; margin-bottom: 8px; font-size: 13px; color: #334e68; }
+          input, textarea, select {
+            width: 100%; padding: 9px 10px; border: 1px solid #b8cbe0; border-radius: 10px;
+            font-size: 13px; font-family: inherit; margin-top: 5px;
+          }
+          textarea { min-height: 72px; resize: vertical; }
+          .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+          .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+          .btn {
+            border: 0; border-radius: 10px; padding: 10px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+          }
+          .btn-primary { background: var(--primary); color: #fff; }
+          .btn-primary:hover { background: var(--primary-dark); }
+          .btn-ghost { background: #e7eef9; color: #123; }
+          .btn-danger { background: #fce7e7; color: #8d1f1f; }
+          .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+          .status {
+            margin-top: 8px; padding: 10px 12px; border-radius: 10px; background: #eef6ff; color: #24476b; font-size: 13px;
+            border: 1px solid #d0e2ff;
+          }
+          .status.error { background: #ffecec; color: var(--error); border-color: #ffcece; }
+          .status.success { background: #ecfff3; color: var(--ok); border-color: #c9f1d8; }
+          table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+          th, td { border-bottom: 1px solid #e2e8f0; text-align: left; padding: 8px 6px; vertical-align: top; }
+          th { color: #486581; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+          .hidden { display: none !important; }
+          .chip {
+            display: inline-block; background: #ecf2ff; color: #274060; border: 1px solid #cfdaf0;
+            border-radius: 999px; padding: 2px 8px; font-size: 11px;
+          }
+          .small { font-size: 12px; color: var(--muted); }
+          .right { margin-left: auto; }
+          @media (max-width: 980px) {
+            .grid, .row-2, .row-3 { grid-template-columns: 1fr; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="header">
+            <div class="title">
+              <h1>Sale Task Dispatch Dashboard</h1>
+              <p>Login -> Add teacher -> Push trial task -> Teacher receives in extension popup.</p>
+            </div>
+            <div class="toolbar">
+              <span id="authChip" class="chip">Not logged in</span>
+              <button id="btnLogout" class="btn btn-danger hidden" type="button">Logout</button>
+            </div>
+          </div>
+
+          <div class="grid">
+            <section class="panel">
+              <h2>1) Sale Login</h2>
+              <div id="googleBlock">
+                <p class="muted">Google Sign-In</p>
+                <div id="googleDisabledMessage" class="status hidden error">Google login is disabled: GOOGLE_CLIENT_ID is missing on server.</div>
+                <div id="g_id_onload"
+                     data-client_id="__GOOGLE_CLIENT_ID__"
+                     data-context="signin"
+                     data-ux_mode="popup"
+                     data-callback="handleGoogleCredential"
+                     data-auto_prompt="false"></div>
+                <div class="g_id_signin"
+                     data-type="standard"
+                     data-shape="pill"
+                     data-theme="outline"
+                     data-text="sign_in_with"
+                     data-size="large"></div>
+              </div>
+
+              <details style="margin-top:10px">
+                <summary class="small">Manual fallback login (email/password)</summary>
+                <form id="manualLoginForm" style="margin-top:8px">
+                  <label>Email
+                    <input id="loginEmail" type="email" placeholder="sale@mindx.local" required>
+                  </label>
+                  <label>Password
+                    <input id="loginPassword" type="password" required>
+                  </label>
+                  <button class="btn btn-ghost" type="submit">Login Manual</button>
+                </form>
+              </details>
+              <div id="authStatus" class="status">Please login to continue.</div>
+            </section>
+
+            <section class="panel">
+              <h2>2) Teacher Directory (UID + Email)</h2>
+              <form id="teacherForm">
+                <div class="row-3">
+                  <label>Teacher UID
+                    <input id="teacherUid" required placeholder="teacher_001">
+                  </label>
+                  <label>Teacher Email
+                    <input id="teacherEmail" type="email" placeholder="teacher001@mindx.edu.vn">
+                  </label>
+                  <label>Teacher Name
+                    <input id="teacherName" placeholder="Teacher Minh">
+                  </label>
+                </div>
+                <div class="toolbar" style="margin-top:8px">
+                  <button class="btn btn-primary" type="submit">Save Teacher</button>
+                  <button id="btnRefreshTeachers" class="btn btn-ghost" type="button">Refresh List</button>
+                </div>
+              </form>
+              <table>
+                <thead>
+                  <tr>
+                    <th>UID</th>
+                    <th>Email</th>
+                    <th>Name</th>
+                    <th>Tasks</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="teachersTbody"></tbody>
+              </table>
+            </section>
+
+            <section class="panel full">
+              <h2>3) Push Trial Task to Teacher</h2>
+              <form id="taskForm">
+                <div class="row-3">
+                  <label>Teacher UID
+                    <input id="taskTeacherUid" required placeholder="teacher_001">
+                  </label>
+                  <label>Teacher Email
+                    <input id="taskTeacherEmail" type="email" placeholder="teacher001@mindx.edu.vn">
+                  </label>
+                  <label>Teacher Name
+                    <input id="taskTeacherName" placeholder="Teacher Minh">
+                  </label>
+                </div>
+                <div class="row-3">
+                  <label>Student Name
+                    <input id="studentName" required>
+                  </label>
+                  <label>Age
+                    <input id="studentAge" type="number" min="4" max="100" value="10">
+                  </label>
+                  <label>Course
+                    <input id="studentCourse" required placeholder="Scratch SB">
+                  </label>
+                </div>
+                <div class="row-3">
+                  <label>Schedule Date
+                    <input id="scheduleDate" type="date" required>
+                  </label>
+                  <label>Schedule Time
+                    <input id="scheduleTime" type="time" required>
+                  </label>
+                  <label>Consultant Info
+                    <input id="consultantInfo" placeholder="Sale A">
+                  </label>
+                </div>
+                <label>Notes
+                  <textarea id="studentNotes" placeholder="Context for teacher..."></textarea>
+                </label>
+                <label>Data Logs
+                  <textarea id="taskDataLogs" placeholder="Optional internal log"></textarea>
+                </label>
+                <div class="toolbar">
+                  <button class="btn btn-primary" type="submit">Push Task</button>
+                  <button id="btnLoadTasks" class="btn btn-ghost" type="button">Refresh Recent Tasks</button>
+                </div>
+              </form>
+            </section>
+
+            <section class="panel full">
+              <h2>4) Recent Task Dispatch</h2>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Teacher UID</th>
+                    <th>Teacher Email</th>
+                    <th>Student</th>
+                    <th>Course</th>
+                    <th>Schedule</th>
+                    <th>Status</th>
+                    <th>Assigned By</th>
+                  </tr>
+                </thead>
+                <tbody id="tasksTbody"></tbody>
+              </table>
+            </section>
+          </div>
+        </div>
+
+        <script>
+          const GOOGLE_ENABLED = "__GOOGLE_ENABLED__" === "1";
+          const STORAGE_KEY = "sale_dashboard_token";
+          const USER_KEY = "sale_dashboard_user";
+          const state = {
+            token: localStorage.getItem(STORAGE_KEY) || "",
+            user: null,
+            teachers: [],
+            tasks: []
+          };
+
+          try {
+            const raw = localStorage.getItem(USER_KEY);
+            if (raw) state.user = JSON.parse(raw);
+          } catch (e) {}
+
+          const authChip = document.getElementById("authChip");
+          const authStatus = document.getElementById("authStatus");
+          const btnLogout = document.getElementById("btnLogout");
+          const googleDisabledMessage = document.getElementById("googleDisabledMessage");
+          const manualLoginForm = document.getElementById("manualLoginForm");
+          const teachersTbody = document.getElementById("teachersTbody");
+          const tasksTbody = document.getElementById("tasksTbody");
+
+          const teacherForm = document.getElementById("teacherForm");
+          const teacherUid = document.getElementById("teacherUid");
+          const teacherEmail = document.getElementById("teacherEmail");
+          const teacherName = document.getElementById("teacherName");
+          const btnRefreshTeachers = document.getElementById("btnRefreshTeachers");
+
+          const taskForm = document.getElementById("taskForm");
+          const taskTeacherUid = document.getElementById("taskTeacherUid");
+          const taskTeacherEmail = document.getElementById("taskTeacherEmail");
+          const taskTeacherName = document.getElementById("taskTeacherName");
+          const btnLoadTasks = document.getElementById("btnLoadTasks");
+
+          function setStatus(message, kind = "info") {
+            authStatus.textContent = message;
+            authStatus.className = "status";
+            if (kind === "error") authStatus.classList.add("error");
+            if (kind === "success") authStatus.classList.add("success");
+          }
+
+          function setAuth(token, user) {
+            state.token = token || "";
+            state.user = user || null;
+            if (state.token) {
+              localStorage.setItem(STORAGE_KEY, state.token);
+            } else {
+              localStorage.removeItem(STORAGE_KEY);
+            }
+            if (state.user) {
+              localStorage.setItem(USER_KEY, JSON.stringify(state.user));
+            } else {
+              localStorage.removeItem(USER_KEY);
+            }
+            renderAuth();
+          }
+
+          function renderAuth() {
+            if (!state.token || !state.user) {
+              authChip.textContent = "Not logged in";
+              btnLogout.classList.add("hidden");
+              return;
+            }
+            authChip.textContent = `${state.user.fullName || state.user.email || state.user.uid} (${state.user.role})`;
+            btnLogout.classList.remove("hidden");
+          }
+
+          async function api(path, options = {}, needAuth = true) {
+            const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+            if (needAuth) {
+              if (!state.token) throw new Error("Not authenticated");
+              headers.Authorization = `Bearer ${state.token}`;
+            }
+            const response = await fetch(path, { ...options, headers });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(data.detail || data.message || `Request failed (${response.status})`);
+            }
+            return data;
+          }
+
+          function renderTeachers() {
+            if (!state.teachers.length) {
+              teachersTbody.innerHTML = '<tr><td colspan="5" class="small">No teachers yet.</td></tr>';
+              return;
+            }
+
+            teachersTbody.innerHTML = state.teachers.map((t) => `
+              <tr>
+                <td>${t.uid || ""}</td>
+                <td>${t.email || ""}</td>
+                <td>${t.fullName || ""}</td>
+                <td>${t.taskCount || 0}</td>
+                <td><button class="btn btn-ghost" data-use-teacher="${t.uid || ""}" type="button">Use</button></td>
+              </tr>
+            `).join("");
+          }
+
+          function renderTasks() {
+            if (!state.tasks.length) {
+              tasksTbody.innerHTML = '<tr><td colspan="7" class="small">No tasks.</td></tr>';
+              return;
+            }
+
+            tasksTbody.innerHTML = state.tasks.map((task) => `
+              <tr>
+                <td>${task.teacherUid || ""}</td>
+                <td>${task.teacherEmail || ""}</td>
+                <td>${task.studentName || ""}</td>
+                <td>${task.course || ""}</td>
+                <td>${(task.schedule?.date || "") + " " + (task.schedule?.time || "")}</td>
+                <td>${task.absent ? "absent" : (task.trialStatus || "pending")}</td>
+                <td>${task.assignedBy || ""}</td>
+              </tr>
+            `).join("");
+          }
+
+          async function ensureMe() {
+            if (!state.token) return;
+            try {
+              const res = await api("/api/auth/me");
+              setAuth(state.token, res.user);
+              setStatus(`Logged in as ${res.user.email || res.user.uid}`, "success");
+            } catch (err) {
+              setAuth("", null);
+              setStatus(err.message, "error");
+            }
+          }
+
+          async function loadTeachers() {
+            const res = await api("/api/sale/teachers");
+            state.teachers = res.teachers || [];
+            renderTeachers();
+          }
+
+          async function loadTasks() {
+            const res = await api("/api/sale/tasks");
+            state.tasks = res.tasks || [];
+            renderTasks();
+          }
+
+          window.handleGoogleCredential = async (response) => {
+            try {
+              const res = await api("/api/auth/sale/google", {
+                method: "POST",
+                body: JSON.stringify({ idToken: response.credential })
+              }, false);
+              setAuth(res.data.token, res.data.user);
+              setStatus(`Google login success: ${res.data.user.email || res.data.user.uid}`, "success");
+              await Promise.all([loadTeachers(), loadTasks()]);
+            } catch (err) {
+              setStatus(`Google login failed: ${err.message}`, "error");
+            }
+          };
+
+          manualLoginForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const email = document.getElementById("loginEmail").value.trim();
+            const password = document.getElementById("loginPassword").value;
+            try {
+              const res = await api("/api/auth/sale/login", {
+                method: "POST",
+                body: JSON.stringify({ email, password })
+              }, false);
+              setAuth(res.data.token, res.data.user);
+              setStatus(`Manual login success: ${res.data.user.email || res.data.user.uid}`, "success");
+              await Promise.all([loadTeachers(), loadTasks()]);
+            } catch (err) {
+              setStatus(`Login failed: ${err.message}`, "error");
+            }
+          });
+
+          teacherForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            try {
+              const payload = {
+                teacher_uid: teacherUid.value.trim(),
+                teacher_email: teacherEmail.value.trim(),
+                teacher_name: teacherName.value.trim()
+              };
+              await api("/api/sale/teachers/upsert", {
+                method: "POST",
+                body: JSON.stringify(payload)
+              });
+              setStatus("Teacher saved.", "success");
+              teacherForm.reset();
+              await loadTeachers();
+            } catch (err) {
+              setStatus(`Save teacher failed: ${err.message}`, "error");
+            }
+          });
+
+          taskForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            try {
+              const payload = {
+                tasks: [
+                  {
+                    teacher_uid: taskTeacherUid.value.trim(),
+                    teacher_email: taskTeacherEmail.value.trim(),
+                    teacher_name: taskTeacherName.value.trim(),
+                    student_name: document.getElementById("studentName").value.trim(),
+                    age: Number(document.getElementById("studentAge").value || 0),
+                    course: document.getElementById("studentCourse").value.trim(),
+                    notes: document.getElementById("studentNotes").value.trim(),
+                    consultant_info: document.getElementById("consultantInfo").value.trim(),
+                    schedule_date: document.getElementById("scheduleDate").value,
+                    schedule_time: document.getElementById("scheduleTime").value,
+                    source: "assigned",
+                    data_logs: document.getElementById("taskDataLogs").value.trim()
+                  }
+                ]
+              };
+              await api("/api/sale/tasks/push", {
+                method: "POST",
+                body: JSON.stringify(payload)
+              });
+              setStatus("Task pushed to teacher.", "success");
+              taskForm.reset();
+              await Promise.all([loadTeachers(), loadTasks()]);
+            } catch (err) {
+              setStatus(`Push task failed: ${err.message}`, "error");
+            }
+          });
+
+          btnRefreshTeachers.addEventListener("click", async () => {
+            try {
+              await loadTeachers();
+              setStatus("Teacher list refreshed.", "success");
+            } catch (err) {
+              setStatus(`Refresh teachers failed: ${err.message}`, "error");
+            }
+          });
+
+          btnLoadTasks.addEventListener("click", async () => {
+            try {
+              await loadTasks();
+              setStatus("Task list refreshed.", "success");
+            } catch (err) {
+              setStatus(`Refresh tasks failed: ${err.message}`, "error");
+            }
+          });
+
+          teachersTbody.addEventListener("click", (event) => {
+            const button = event.target.closest("[data-use-teacher]");
+            if (!button) return;
+            const uid = button.getAttribute("data-use-teacher");
+            const teacher = state.teachers.find((x) => x.uid === uid);
+            if (!teacher) return;
+
+            taskTeacherUid.value = teacher.uid || "";
+            taskTeacherEmail.value = teacher.email || "";
+            taskTeacherName.value = teacher.fullName || "";
+          });
+
+          btnLogout.addEventListener("click", async () => {
+            try {
+              await api("/api/auth/logout", { method: "POST" });
+            } catch (e) {}
+            setAuth("", null);
+            state.teachers = [];
+            state.tasks = [];
+            renderTeachers();
+            renderTasks();
+            setStatus("Logged out.");
+          });
+
+          (async () => {
+            if (!GOOGLE_ENABLED) {
+              googleDisabledMessage.classList.remove("hidden");
+            }
+            renderAuth();
+            await ensureMe();
+            if (state.token) {
+              await Promise.all([loadTeachers(), loadTasks()]);
+            } else {
+              renderTeachers();
+              renderTasks();
+            }
+          })();
+        </script>
+      </body>
+    </html>
+    """
+    return (
+        template.replace("__GOOGLE_CLIENT_ID__", GOOGLE_CLIENT_ID or "")
+        .replace("__GOOGLE_ENABLED__", "1" if GOOGLE_CLIENT_ID else "0")
+    )
+
+
+@app.get("/sale-dashboard", response_class=HTMLResponse)
+async def sale_dashboard():
+    return render_sale_dashboard_html()
+
+
 @app.get("/api/logs")
 async def get_logs():
     return {"logs": SYSTEM_LOGS}
@@ -852,7 +1569,11 @@ async def dashboard():
         <h2>LMS PERFORMANCE TRACKER API</h2>
         <div class="tips">
           Endpoints:<br/>
+          - <a href="/sale-dashboard" style="color:#8be9fd">/sale-dashboard</a><br/>
           - POST /api/auth/sale/login<br/>
+          - POST /api/auth/sale/google<br/>
+          - GET /api/sale/teachers<br/>
+          - POST /api/sale/teachers/upsert<br/>
           - POST /api/sale/tasks/push<br/>
           - GET /api/trial-tasks?userId=...<br/>
           - POST /api/trial-tasks/submit
