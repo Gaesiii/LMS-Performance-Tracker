@@ -1366,6 +1366,58 @@ def render_sale_dashboard_html() -> str:
             `).join("");
           }
 
+          function mergeTeachersFromTasks() {
+            if (!state.tasks.length) return;
+
+            const teacherMap = new Map();
+            for (const teacher of state.teachers) {
+              const uid = (teacher.uid || "").trim();
+              if (uid) teacherMap.set(uid, teacher);
+            }
+
+            const taskCountByUid = {};
+            let changed = false;
+
+            for (const task of state.tasks) {
+              const uid = (task.teacherUid || "").trim();
+              if (!uid) continue;
+
+              taskCountByUid[uid] = (taskCountByUid[uid] || 0) + 1;
+              if (teacherMap.has(uid)) {
+                const existing = teacherMap.get(uid);
+                const incomingEmail = (task.teacherEmail || "").trim();
+                if (!existing.email && incomingEmail) {
+                  existing.email = incomingEmail;
+                  changed = true;
+                }
+                continue;
+              }
+
+              const teacher = {
+                uid,
+                email: (task.teacherEmail || "").trim(),
+                fullName: uid,
+                taskCount: 0
+              };
+              state.teachers.push(teacher);
+              teacherMap.set(uid, teacher);
+              changed = true;
+            }
+
+            Object.entries(taskCountByUid).forEach(([uid, count]) => {
+              const teacher = teacherMap.get(uid);
+              if (!teacher) return;
+              const previousCount = Number(teacher.taskCount || 0);
+              const nextCount = Math.max(previousCount, Number(count || 0));
+              if (previousCount !== nextCount) {
+                teacher.taskCount = nextCount;
+                changed = true;
+              }
+            });
+
+            if (changed) renderTeachers();
+          }
+
           async function ensureMe() {
             if (!state.token) return;
             try {
@@ -1388,6 +1440,7 @@ def render_sale_dashboard_html() -> str:
             const res = await api("/api/sale/tasks");
             state.tasks = res.tasks || [];
             renderTasks();
+            mergeTeachersFromTasks();
           }
 
           window.handleGoogleCredential = async (response) => {
